@@ -205,11 +205,21 @@ NSString* GCNameFromHostingService(GCHostingService service) {
         if (delta.submodule) {
           GCSubmodule* submodule = [self lookupSubmoduleWithName:delta.canonicalPath error:error];
           if (!submodule || ![self addSubmoduleToRepositoryIndex:submodule error:error]) {
-            return NO;
+            BOOL wasJustTryingToStageAnUntrackedSubmodule = error && [[*error localizedDescription] hasSuffix:@"' has not been added yet"];
+            
+            if (!wasJustTryingToStageAnUntrackedSubmodule) {
+              return NO;
+            }
           }
         } else {
           if (![self addFileInWorkingDirectory:delta.canonicalPath toIndex:index error:error]) {
-            return NO;
+            BOOL wasJustTryingToStageADeletedConflictingFile =
+              delta.change == kGCFileDiffChange_Conflicted
+              && (error && [[*error localizedDescription] isEqualToString:@"No such file or directory"]);
+            
+            if (!wasJustTryingToStageADeletedConflictingFile) {
+              return NO;
+            }
           }
         }
         break;
@@ -292,7 +302,7 @@ NSString* GCNameFromHostingService(GCHostingService service) {
   if (![self lookupHEADCurrentCommit:&headCommit branch:NULL error:error]) {
     return NO;
   }
-  GCCheckoutOptions options = kGCCheckoutOption_Force;
+  GCCheckoutOptions options = kGCCheckoutOption_Force | kGCCheckoutOption_RemoveUntrackedFiles;
   if (recursive) {
     options |= kGCCheckoutOption_UpdateSubmodulesRecursively;
   }

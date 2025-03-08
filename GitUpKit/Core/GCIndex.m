@@ -39,11 +39,11 @@ extern void git_index_entry__init_from_stat(git_index_entry* entry, struct stat*
       _status = ancestor ? kGCIndexConflictStatus_BothModified : kGCIndexConflictStatus_BothAdded;
 
       git_oid_cpy(&_ourOID, &our->id);
-      XLOG_DEBUG_CHECK((our->mode == GIT_FILEMODE_BLOB) || (our->mode == GIT_FILEMODE_BLOB_EXECUTABLE) || (our->mode == GIT_FILEMODE_LINK));
+      XLOG_DEBUG_CHECK((our->mode == GIT_FILEMODE_BLOB) || (our->mode == GIT_FILEMODE_BLOB_EXECUTABLE) || (our->mode == GIT_FILEMODE_LINK) || (our->mode == GIT_FILEMODE_COMMIT));
       _ourFileMode = GCFileModeFromMode(our->mode);
 
       git_oid_cpy(&_theirOID, &their->id);
-      XLOG_DEBUG_CHECK((their->mode == GIT_FILEMODE_BLOB) || (their->mode == GIT_FILEMODE_BLOB_EXECUTABLE) || (their->mode == GIT_FILEMODE_LINK));
+      XLOG_DEBUG_CHECK((their->mode == GIT_FILEMODE_BLOB) || (their->mode == GIT_FILEMODE_BLOB_EXECUTABLE) || (their->mode == GIT_FILEMODE_LINK) || (their->mode == GIT_FILEMODE_COMMIT));
       _theirFileMode = GCFileModeFromMode(their->mode);
     } else if (our) {
       XLOG_DEBUG_CHECK(!strcmp(our->path, ancestor->path));
@@ -64,7 +64,7 @@ extern void git_index_entry__init_from_stat(git_index_entry* entry, struct stat*
     }
     if (ancestor) {
       git_oid_cpy(&_ancestorOID, &ancestor->id);
-      XLOG_DEBUG_CHECK((ancestor->mode == GIT_FILEMODE_BLOB) || (ancestor->mode == GIT_FILEMODE_BLOB_EXECUTABLE) || (ancestor->mode == GIT_FILEMODE_LINK));
+      XLOG_DEBUG_CHECK((ancestor->mode == GIT_FILEMODE_BLOB) || (ancestor->mode == GIT_FILEMODE_BLOB_EXECUTABLE) || (ancestor->mode == GIT_FILEMODE_LINK) || (ancestor->mode == GIT_FILEMODE_COMMIT));
       _ancestorFileMode = GCFileModeFromMode(ancestor->mode);
     }
     if (our) {
@@ -301,6 +301,16 @@ cleanup:
   return YES;
 }
 
+// This function adapts to handle submodules by directly using the commit OID and setting the correct file mode for submodules.
+- (BOOL)_addSubmoduleEntry:(const git_index_entry*)entry toIndex:(git_index*)index withCommitOid:(const git_oid *)commitOid error:(NSError**)error {
+  git_index_entry copyEntry;
+  bcopy(entry, &copyEntry, sizeof(git_index_entry));
+  git_oid_cpy(&copyEntry.id, commitOid);
+  copyEntry.mode = GIT_FILEMODE_COMMIT;
+  CALL_LIBGIT2_FUNCTION_RETURN(NO, git_index_add, index, &copyEntry);
+  return YES;
+}
+
 - (BOOL)addFile:(NSString*)path withContents:(NSData*)contents toIndex:(GCIndex*)index error:(NSError**)error {
   git_index_entry entry;
   bzero(&entry, sizeof(git_index_entry));
@@ -316,13 +326,38 @@ cleanup:
   bzero(&entry, sizeof(git_index_entry));
   entry.path = GCGitPathFromFileSystemPath(path);
   git_index_entry__init_from_stat(&entry, &info, true);
-  return [self _addEntry:&entry toIndex:index.private error:error];
+
+  if (entry.mode == GIT_FILEMODE_COMMIT) {
+    GCSubmodule *submodule = [self lookupSubmoduleWithName:path error:error];
+    if (!submodule) {
+      return NO;
+    }
+
+    GCRepository *submoduleRepository = [[GCRepository alloc] initWithSubmodule:submodule error:error];
+    if (!submoduleRepository) {
+      return NO;
+    }
+
+    GCCommit *headCommit;
+    if (![submoduleRepository lookupHEADCurrentCommit:&headCommit branch:NULL error:error]) {
+      return NO;
+    }
+
+    git_oid oid;
+    if (!GCGitOIDFromSHA1(headCommit.SHA1, &oid, error)) {
+      return NO;
+    }
+
+    return [self _addSubmoduleEntry:&entry toIndex:index.private withCommitOid:&oid error:error];
+  } else {
+    return [self _addEntry:&entry toIndex:index.private error:error];
+  }
 }
 
 - (BOOL)addLinesInWorkingDirectoryFile:(NSString*)path toIndex:(GCIndex*)index error:(NSError**)error usingFilter:(GCIndexLineFilter)filter {
   const char* filePath = GCGitPathFromFileSystemPath(path);
 
-  // If the file is already in the index, preserve the entry, otherwise create a new entry from the file metadata
+  // If the file is already in the index, mutate the entry, otherwise create a new entry from the file metadata
   git_index_entry entry;
   const git_index_entry* entryPtr = git_index_get_bypath(index.private, filePath, 0);
   if (entryPtr == NULL) {
@@ -331,6 +366,11 @@ cleanup:
     bzero(&entry, sizeof(git_index_entry));
     entry.path = filePath;
     git_index_entry__init_from_stat(&entry, &info, true);
+    entryPtr = &entry;
+  } else {
+    // Null out the entry's modification date: otherwise Git might assume the file is unchanged from the on-disk version, and produce incorrect diffs
+    bcopy(entryPtr, &entry, sizeof(git_index_entry));
+    entry.mtime = (git_index_time){.seconds = 0, .nanoseconds = 0};
     entryPtr = &entry;
   }
   NSMutableData* data = [[NSMutableData alloc] initWithCapacity:(1024 * 1024)];
@@ -418,7 +458,7 @@ cleanup:
 - (BOOL)resetLinesInFile:(NSString*)path index:(GCIndex*)index toCommit:(GCCommit*)commit error:(NSError**)error usingFilter:(GCIndexLineFilter)filter {
   const char* filePath = GCGitPathFromFileSystemPath(path);
 
-  // If the file is already in the index, preserve the entry, otherwise create a new entry from the file blob
+  // If the file is already in the index, mutate the entry, otherwise create a new entry from the file blob
   git_index_entry entry;
   const git_index_entry* entryPtr = git_index_get_bypath(index.private, filePath, 0);
   if (entryPtr == NULL) {
@@ -433,6 +473,11 @@ cleanup:
     entry.mode = git_tree_entry_filemode(treeEntry);
     entryPtr = &entry;
     git_tree_entry_free(treeEntry);
+  } else {
+    // Null out the entry's modification date: otherwise Git might assume the file is unchanged from the on-disk version, and produce incorrect diffs
+    bcopy(entryPtr, &entry, sizeof(git_index_entry));
+    entry.mtime = (git_index_time){.seconds = 0, .nanoseconds = 0};
+    entryPtr = &entry;
   }
   NSMutableData* data = [[NSMutableData alloc] initWithCapacity:(1024 * 1024)];
 
@@ -491,6 +536,10 @@ cleanup:
 }
 
 - (BOOL)checkoutFilesToWorkingDirectory:(NSArray<NSString*>*)paths fromIndex:(GCIndex*)index error:(NSError**)error {
+	if ([paths count] == 0) {
+		return YES;
+	}
+	
   git_checkout_options options = GIT_CHECKOUT_OPTIONS_INIT;
   options.checkout_strategy = GIT_CHECKOUT_FORCE | GIT_CHECKOUT_DONT_UPDATE_INDEX;  // There's no reason to update the index
   options.paths.count = paths.count;
